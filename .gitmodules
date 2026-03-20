@@ -1,0 +1,3 @@
+[submodule "tenjo"]
+	path = tenjo
+	url = git@github.com:netalkGB/tenjo.git
