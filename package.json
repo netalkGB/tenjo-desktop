@@ -1,0 +1,34 @@
+{
+  "name": "tenjo-desktop",
+  "version": "0.0.1",
+  "description": "Tenjo desktop app powered by Electron",
+  "author": "netalkGB",
+  "maintainers": [
+    {
+      "name": "netalkGB",
+      "email": "13611993+netalkGB@users.noreply.github.com",
+      "url": "https://gb.netalk.dev/"
+    }
+  ],
+  "main": "main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "dev": "electron . --dev",
+    "setup": "node scripts/setup.js",
+    "build:mac": "electron-builder --mac",
+    "build:win": "electron-builder --win",
+    "build:linux": "electron-builder --linux",
+    "build:all": "electron-builder --mac --win --linux",
+    "license-report": "node scripts/generate-license-report.mjs"
+  },
+  "dependencies": {
+    "electron-window-state": "^5.0.3",
+    "embedded-postgres": "^18.3.0-beta.16"
+  },
+  "devDependencies": {
+    "electron": "^35.1.5",
+    "electron-builder": "^26.0.12",
+    "license-checker-rseidelsohn": "^4.4.2"
+  }
+}

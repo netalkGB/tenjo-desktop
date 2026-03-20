@@ -1,0 +1,30 @@
+appId: com.tenjo.desktop
+productName: Tenjo
+copyright: "Copyright © 2026 netalkGB"
+
+asar: false
+
+files:
+  - main.js
+  - preload.js
+  - "tenjo/**/*"
+  - "!tenjo/.git"
+  - "!tenjo/client/src/**"
+  - "!tenjo/client/node_modules/**"
+  - "!tenjo/server/src/**"
+  - "!tenjo/server/tests/**"
+
+mac:
+  target:
+    - dmg
+    - zip
+
+win:
+  target:
+    - nsis
+    - portable
+
+linux:
+  target:
+    - AppImage
+    - deb
