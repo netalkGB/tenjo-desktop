@@ -1,4 +1,4 @@
-const { app, BrowserWindow, Menu, shell } = require('electron');
+const { app, BrowserWindow, Menu, shell, safeStorage, dialog } = require('electron');
 const path = require('path');
 const fs = require('fs');
 const os = require('os');
@@ -61,12 +61,16 @@ const i18n = {
     closeWindow: 'ウインドウを閉じる',
     undo: '取り消す', redo: 'やり直す', cut: 'カット', copy: 'コピー',
     paste: 'ペースト', selectAll: 'すべてを選択',
+    oauthError: 'OAuth認可に失敗しました',
+    oauthSuccess: 'OAuth認可が完了しました',
   },
   en: {
     file: 'File', edit: 'Edit', view: 'View', window: 'Window',
     closeWindow: 'Close Window',
     undo: 'Undo', redo: 'Redo', cut: 'Cut', copy: 'Copy',
     paste: 'Paste', selectAll: 'Select All',
+    oauthError: 'OAuth authorization failed',
+    oauthSuccess: 'OAuth authorization completed',
   },
 };
 
@@ -149,9 +153,120 @@ function buildAppMenu() {
 
 installDummyArgon2();
 
+const PROTOCOL_SCHEME = 'dev.netalk.app.tenjo';
+
 let mainWindow = null;
+
+// Create BrowserWindow with all event handlers (used on initial launch and macOS re-activate)
+function createMainWindow(port) {
+  const windowStateKeeper = require('electron-window-state');
+  const windowState = windowStateKeeper({
+    defaultWidth: 1200,
+    defaultHeight: 750,
+  });
+
+  const { nativeTheme } = require('electron');
+  const isDark = nativeTheme.shouldUseDarkColors;
+
+  mainWindow = new BrowserWindow({
+    x: windowState.x,
+    y: windowState.y,
+    width: windowState.width,
+    height: windowState.height,
+    minWidth: 480,
+    minHeight: 400,
+    backgroundColor: isDark ? '#000000' : '#ffffff',
+    webPreferences: {
+      preload: path.join(__dirname, 'preload.js'),
+    },
+  });
+  windowState.manage(mainWindow);
+  mainWindow.loadURL(`http://127.0.0.1:${port}`);
+
+  // Disable reload (Cmd+R, Ctrl+R, F5, Cmd+Shift+R)
+  mainWindow.webContents.on('before-input-event', (event, input) => {
+    const key = input.key.toLowerCase();
+    if ((input.control || input.meta) && key === 'r') {
+      event.preventDefault();
+    }
+    if (key === 'f5') {
+      event.preventDefault();
+    }
+  });
+  mainWindow.webContents.reload = () => {};
+  mainWindow.webContents.reloadIgnoringCache = () => {};
+
+  // Prevent dragging links and images
+  mainWindow.webContents.on('did-finish-load', () => {
+    mainWindow.webContents.insertCSS('a, img { -webkit-user-drag: none !important; user-drag: none !important; }');
+    mainWindow.webContents.executeJavaScript(`
+      document.addEventListener('dragstart', (e) => {
+        if (e.target.tagName === 'A' || e.target.tagName === 'IMG' || e.target.closest('a')) {
+          e.preventDefault();
+        }
+      }, true);
+    `);
+  });
+
+  // Right-click context menu
+  mainWindow.webContents.on('context-menu', (_event, params) => {
+    const items = [];
+    if (params.isEditable) {
+      items.push(
+        { label: t('undo'), role: 'undo' },
+        { label: t('redo'), role: 'redo' },
+        { type: 'separator' },
+        { label: t('cut'), role: 'cut' },
+        { label: t('copy'), role: 'copy' },
+        { label: t('paste'), role: 'paste' },
+        { type: 'separator' },
+        { label: t('selectAll'), role: 'selectAll' },
+      );
+    } else if (params.selectionText) {
+      items.push(
+        { label: t('copy'), role: 'copy' },
+        { type: 'separator' },
+        { label: t('selectAll'), role: 'selectAll' },
+      );
+    }
+    if (items.length > 0) {
+      Menu.buildFromTemplate(items).popup({ window: mainWindow });
+    }
+  });
+
+  // Block navigation away from the local server
+  const allowedOrigin = `http://127.0.0.1:${port}`;
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    if (!url.startsWith(allowedOrigin)) {
+      event.preventDefault();
+      shell.openExternal(url);
+    }
+  });
+
+  // Block new windows (middle-click, target="_blank", window.open) —
+  // open external URLs in the system browser, discard local ones
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (!url.startsWith(allowedOrigin)) {
+      shell.openExternal(url);
+    }
+    return { action: 'deny' };
+  });
+
+  // macOS: hide instead of closing so re-activate doesn't reload the page
+  mainWindow.on('close', (e) => {
+    if (process.platform === 'darwin' && !isQuitting) {
+      e.preventDefault();
+      mainWindow.hide();
+    }
+  });
+
+  mainWindow.on('closed', () => {
+    mainWindow = null;
+  });
+}
 let embeddedPg = null;
 let tenjoServer = null;
+let mcpOAuthService = null;
 let socketDir = null;
 let isQuitting = false;
 
@@ -167,6 +282,9 @@ if (!gotTheLock) {
     }
   });
 }
+
+// Register custom URL scheme (tenjo://) for OAuth callbacks
+app.setAsDefaultProtocolClient(PROTOCOL_SCHEME);
 
 // Suppress pg connection errors during shutdown
 process.on('uncaughtException', (err) => {
@@ -185,21 +303,37 @@ http.Server.prototype.listen = function (...args) {
 };
 
 app.whenReady().then(async () => {
+  app.setName('Tenjo');
   buildAppMenu();
   try {
     // Determine persistent data directory
     const userData = app.getPath('userData');
 
-    // Generate or load session secret
-    const secretPath = path.join(userData, '.session-secret');
-    let sessionSecret;
-    try {
-      sessionSecret = fs.readFileSync(secretPath, 'utf-8');
-    } catch {
-      sessionSecret = cryptoModule.randomBytes(32).toString('hex');
-      fs.mkdirSync(path.dirname(secretPath), { recursive: true });
-      fs.writeFileSync(secretPath, sessionSecret, { mode: 0o600 });
+    // Retrieve or generate all secrets via Electron safeStorage (stored as JSON)
+    const secretsPath = path.join(userData, '.secrets');
+    let secrets;
+    if (fs.existsSync(secretsPath)) {
+      try {
+        const encrypted = fs.readFileSync(secretsPath);
+        secrets = JSON.parse(safeStorage.decryptString(encrypted));
+      } catch {
+        // Decryption failed (e.g. app signature changed) — regenerate
+        fs.unlinkSync(secretsPath);
+      }
     }
+    if (!secrets) {
+      secrets = {
+        sessionSecret: cryptoModule.randomBytes(32).toString('hex'),
+        encryptionKey: cryptoModule.randomBytes(32).toString('hex'),
+        pgPassword: cryptoModule.randomBytes(32).toString('hex'),
+      };
+      const encrypted = safeStorage.encryptString(JSON.stringify(secrets));
+      fs.mkdirSync(path.dirname(secretsPath), { recursive: true });
+      fs.writeFileSync(secretsPath, encrypted, { mode: 0o600 });
+    }
+    const sessionSecret = secrets.sessionSecret;
+    const encryptionKey = secrets.encryptionKey;
+    const pgPassword = secrets.pgPassword;
 
     // Prepare embedded PostgreSQL directories
     const isWindows = process.platform === 'win32';
@@ -212,11 +346,6 @@ app.whenReady().then(async () => {
     const pgPort = await findFreePort();
     const tenjoPort = await findFreePort();
 
-    // Ephemeral password: random on every launch, never written to disk.
-    // pg_hba.conf is temporarily set to trust at startup so we can issue
-    // ALTER USER to install the new password, then reverted to scram-sha-256.
-    const pgPassword = cryptoModule.randomBytes(32).toString('hex');
-
     // Set environment variables for tenjo server
     process.env.NODE_ENV = 'production';
     process.env.DATABASE_URL = isWindows
@@ -227,6 +356,8 @@ app.whenReady().then(async () => {
     process.env.LISTEN_HOST = '127.0.0.1';
     process.env.LISTEN_PORT = String(tenjoPort);
     process.env.SINGLE_USER_MODE = 'true';
+    process.env.ENCRYPTION_KEY = encryptionKey;
+    process.env.BASE_URL = `${PROTOCOL_SCHEME}://mcp-oauth/callback`;
     const dataDir = path.join(userData, 'tenjo-server-data');
     fs.mkdirSync(dataDir, { recursive: true });
     process.env.DATA_DIR = dataDir;
@@ -248,138 +379,94 @@ app.whenReady().then(async () => {
 
     const pgVersionPath = path.join(pgDataDir, 'PG_VERSION');
     const pgHbaPath = path.join(pgDataDir, 'pg_hba.conf');
+    const isFirstRun = !fs.existsSync(pgVersionPath);
 
-    if (!fs.existsSync(pgVersionPath)) {
+    if (isFirstRun) {
       await embeddedPg.initialise();
     }
-    // Trust only postgres@postgres for the admin connection; tenjo database stays scram-sha-256.
-    // Both local and host rules are written on all platforms; unreachable rules are harmless.
-    fs.writeFileSync(pgHbaPath, [
-      'local   postgres        postgres                                trust',
-      'host    postgres        postgres        127.0.0.1/32            trust',
+
+    // scram-sha-256 for all connections (used from second launch onward)
+    const scramOnlyHba = [
       'local   all             all                                     scram-sha-256',
       'host    all             all             127.0.0.1/32            scram-sha-256',
       'host    all             all             ::1/128                 scram-sha-256',
-    ].join('\n') + '\n');
-    await embeddedPg.start();
+    ].join('\n') + '\n';
 
-    // Connect via trust (postgres@postgres only), install ephemeral password, lock down
-    {
+    if (isFirstRun) {
+      // First run: temporarily allow trust to set the password
+      fs.writeFileSync(pgHbaPath, [
+        'local   postgres        postgres                                trust',
+        'host    postgres        postgres        127.0.0.1/32            trust',
+        'local   all             all                                     scram-sha-256',
+        'host    all             all             127.0.0.1/32            scram-sha-256',
+        'host    all             all             ::1/128                 scram-sha-256',
+      ].join('\n') + '\n');
+      await embeddedPg.start();
+
       const { Client } = require(path.join(__dirname, 'tenjo', 'node_modules', 'pg'));
       const pgAdmin = new Client(isWindows
         ? { host: '127.0.0.1', port: pgPort, user: 'postgres', database: 'postgres' }
         : { host: socketDir, port: pgPort, user: 'postgres', database: 'postgres' });
       await pgAdmin.connect();
       await pgAdmin.query(`ALTER USER postgres PASSWORD '${pgPassword}'`);
-      // Lock down: scram-sha-256 for all connections
-      fs.writeFileSync(pgHbaPath, [
-        'local   all             all                                     scram-sha-256',
-        'host    all             all             127.0.0.1/32            scram-sha-256',
-        'host    all             all             ::1/128                 scram-sha-256',
-      ].join('\n') + '\n');
+      fs.writeFileSync(pgHbaPath, scramOnlyHba);
       await pgAdmin.query('SELECT pg_reload_conf()');
       await pgAdmin.end();
+    } else {
+      // Subsequent runs: password is persisted in safeStorage, start with scram-sha-256 directly
+      fs.writeFileSync(pgHbaPath, scramOnlyHba);
+      await embeddedPg.start();
     }
 
     // Require tenjo server (triggers auto-start via its IIFE)
-    require('./tenjo/server/dist/index.js');
+    const tenjoExports = require('./tenjo/server/dist/index.js');
+    mcpOAuthService = tenjoExports.mcpOAuthService;
 
     // Wait for the tenjo server to be ready
     await waitForTenjoServer(tenjoPort);
 
-    // Create BrowserWindow (restore previous position/size)
-    const windowStateKeeper = require('electron-window-state');
-    const windowState = windowStateKeeper({
-      defaultWidth: 1200,
-      defaultHeight: 750,
-    });
-
-    mainWindow = new BrowserWindow({
-      x: windowState.x,
-      y: windowState.y,
-      width: windowState.width,
-      height: windowState.height,
-      minWidth: 480,
-      minHeight: 400,
-      webPreferences: {
-        preload: path.join(__dirname, 'preload.js'),
-      },
-    });
-    windowState.manage(mainWindow);
-    mainWindow.loadURL(`http://127.0.0.1:${tenjoPort}`);
-
-    // Disable reload (Cmd+R, Ctrl+R, F5, Cmd+Shift+R)
-    mainWindow.webContents.on('before-input-event', (event, input) => {
-      const key = input.key.toLowerCase();
-      if ((input.control || input.meta) && key === 'r') {
-        event.preventDefault();
+    // Handle OAuth callback from custom URL scheme (tenjo://mcp-oauth/callback?code=...&state=...)
+    function handleOAuthCallbackUrl(url) {
+      if (!url) return;
+      try {
+        const parsed = new URL(url);
+        if (parsed.protocol !== `${PROTOCOL_SCHEME}:`) return;
+        if (parsed.host !== 'mcp-oauth' || parsed.pathname !== '/callback') return;
+        const code = parsed.searchParams.get('code');
+        const state = parsed.searchParams.get('state');
+        if (!code || !state) return;
+        mcpOAuthService.handleCallback({ code, state }).then(() => {
+          if (!mainWindow) return;
+          const currentUrl = mainWindow.webContents.getURL();
+          dialog.showMessageBox(mainWindow, {
+            type: 'info',
+            message: t('oauthSuccess'),
+            buttons: ['OK'],
+          }).then(() => {
+            if (mainWindow) mainWindow.webContents.loadURL(currentUrl);
+          });
+        }).catch(() => {
+          dialog.showErrorBox(t('oauthError'), '');
+        });
+      } catch {
+        // Ignore malformed URLs
       }
-      if (key === 'f5') {
-        event.preventDefault();
-      }
-    });
-    mainWindow.webContents.reload = () => {};
-    mainWindow.webContents.reloadIgnoringCache = () => {};
+    }
 
-    // Prevent dragging links and images
-    mainWindow.webContents.on('did-finish-load', () => {
-      mainWindow.webContents.insertCSS('a, img { -webkit-user-drag: none !important; user-drag: none !important; }');
-      mainWindow.webContents.executeJavaScript(`
-        document.addEventListener('dragstart', (e) => {
-          if (e.target.tagName === 'A' || e.target.tagName === 'IMG' || e.target.closest('a')) {
-            e.preventDefault();
-          }
-        }, true);
-      `);
+    // macOS: handle deep-link URL when app is already running
+    app.on('open-url', (event, url) => {
+      event.preventDefault();
+      handleOAuthCallbackUrl(url);
     });
 
-    // Right-click context menu
-    mainWindow.webContents.on('context-menu', (_event, params) => {
-      const items = [];
-      if (params.isEditable) {
-        items.push(
-          { label: t('undo'), role: 'undo' },
-          { label: t('redo'), role: 'redo' },
-          { type: 'separator' },
-          { label: t('cut'), role: 'cut' },
-          { label: t('copy'), role: 'copy' },
-          { label: t('paste'), role: 'paste' },
-          { type: 'separator' },
-          { label: t('selectAll'), role: 'selectAll' },
-        );
-      } else if (params.selectionText) {
-        items.push(
-          { label: t('copy'), role: 'copy' },
-          { type: 'separator' },
-          { label: t('selectAll'), role: 'selectAll' },
-        );
-      }
-      if (items.length > 0) {
-        Menu.buildFromTemplate(items).popup({ window: mainWindow });
-      }
+    // Windows/Linux: deep-link URL is passed as argv to the second instance
+    app.on('second-instance', (_event, argv) => {
+      const deepLinkUrl = argv.find((arg) => arg.startsWith(`${PROTOCOL_SCHEME}://`));
+      if (deepLinkUrl) handleOAuthCallbackUrl(deepLinkUrl);
     });
 
-    // Block navigation away from the local server
-    const allowedOrigin = `http://127.0.0.1:${tenjoPort}`;
-    mainWindow.webContents.on('will-navigate', (event, url) => {
-      if (!url.startsWith(allowedOrigin)) {
-        event.preventDefault();
-        shell.openExternal(url);
-      }
-    });
-
-    // Block new windows (middle-click, target="_blank", window.open) —
-    // open external URLs in the system browser, discard local ones
-    mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-      if (!url.startsWith(allowedOrigin)) {
-        shell.openExternal(url);
-      }
-      return { action: 'deny' };
-    });
-
-    mainWindow.on('closed', () => {
-      mainWindow = null;
-    });
+    // Create BrowserWindow with all event handlers
+    createMainWindow(tenjoPort);
   } catch (err) {
     process.stderr.write(`Failed to start: ${err && err.stack ? err.stack : String(err)}\n`);
     app.quit();
@@ -393,32 +480,14 @@ app.on('window-all-closed', () => {
   }
 });
 
-// macOS: re-create window when Dock icon is clicked and no windows exist
+// macOS: show hidden window or re-create if somehow destroyed
 app.on('activate', () => {
-  if (BrowserWindow.getAllWindows().length === 0 && mainWindow === null) {
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.show();
+  } else if (BrowserWindow.getAllWindows().length === 0) {
     const tenjoPort = process.env.LISTEN_PORT;
     if (tenjoPort) {
-      const windowStateKeeper = require('electron-window-state');
-      const windowState = windowStateKeeper({
-        defaultWidth: 1200,
-        defaultHeight: 750,
-      });
-      mainWindow = new BrowserWindow({
-        x: windowState.x,
-        y: windowState.y,
-        width: windowState.width,
-        height: windowState.height,
-        minWidth: 480,
-        minHeight: 400,
-        webPreferences: {
-          preload: path.join(__dirname, 'preload.js'),
-        },
-      });
-      windowState.manage(mainWindow);
-      mainWindow.loadURL(`http://127.0.0.1:${tenjoPort}`);
-      mainWindow.on('closed', () => {
-        mainWindow = null;
-      });
+      createMainWindow(tenjoPort);
     }
   }
 });

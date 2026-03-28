@@ -1,6 +1,6 @@
 {
   "name": "tenjo-desktop",
-  "version": "0.0.1",
+  "version": "0.0.2",
   "description": "Tenjo desktop app powered by Electron",
   "author": "netalkGB",
   "maintainers": [

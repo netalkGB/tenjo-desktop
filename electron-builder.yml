@@ -1,8 +1,13 @@
-appId: com.tenjo.desktop
+appId: dev.netalk.app.tenjo
 productName: Tenjo
 copyright: "Copyright © 2026 netalkGB"
 
 asar: false
+
+protocols:
+  - name: Tenjo
+    schemes:
+      - dev.netalk.app.tenjo
 
 files:
   - main.js
@@ -15,6 +20,9 @@ files:
   - "!tenjo/server/tests/**"
 
 mac:
+  hardenedRuntime: true
+  entitlements: build/entitlements.mac.plist
+  entitlementsInherit: build/entitlements.mac.plist
   target:
     - dmg
     - zip
